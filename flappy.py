@@ -3,10 +3,13 @@ import random
 import sys
 import pygame
 from pygame.locals import *
+import os
+import neat
 
 FPS = 30
 SCREENWIDTH  = 288
 SCREENHEIGHT = 512
+PIPEGAP      = 160 # gap between pipes
 PIPEGAPSIZE  = 100 # gap between upper and lower part of pipe
 BASEY        = SCREENHEIGHT * 0.79
 # image, sound and hitmask  dicts
@@ -47,10 +50,7 @@ PIPES_LIST = (
 )
 
 
-try:
-    xrange
-except NameError:
-    xrange = range
+xrange = range
 
 
 def main():
@@ -93,170 +93,161 @@ def main():
     SOUNDS['swoosh'] = pygame.mixer.Sound('assets/audio/swoosh' + soundExt)
     SOUNDS['wing']   = pygame.mixer.Sound('assets/audio/wing' + soundExt)
 
-    while True:
-        # select random background sprites
-        randBg = random.randint(0, len(BACKGROUNDS_LIST) - 1)
-        IMAGES['background'] = pygame.image.load(BACKGROUNDS_LIST[randBg]).convert()
+    # select random background sprites
+    randBg = random.randint(0, len(BACKGROUNDS_LIST) - 1)
+    IMAGES['background'] = pygame.image.load(BACKGROUNDS_LIST[randBg]).convert()
 
-        # select random player sprites
-        randPlayer = random.randint(0, len(PLAYERS_LIST) - 1)
-        IMAGES['player'] = (
-            pygame.image.load(PLAYERS_LIST[randPlayer][0]).convert_alpha(),
-            pygame.image.load(PLAYERS_LIST[randPlayer][1]).convert_alpha(),
-            pygame.image.load(PLAYERS_LIST[randPlayer][2]).convert_alpha(),
-        )
+    # select random player sprites
+    randPlayer = random.randint(0, len(PLAYERS_LIST) - 1)
+    IMAGES['player'] = (
+        pygame.image.load(PLAYERS_LIST[randPlayer][0]).convert_alpha(),
+        pygame.image.load(PLAYERS_LIST[randPlayer][1]).convert_alpha(),
+        pygame.image.load(PLAYERS_LIST[randPlayer][2]).convert_alpha(),
+    )
 
-        # select random pipe sprites
-        pipeindex = random.randint(0, len(PIPES_LIST) - 1)
-        IMAGES['pipe'] = (
-            pygame.transform.flip(
-                pygame.image.load(PIPES_LIST[pipeindex]).convert_alpha(), False, True),
-            pygame.image.load(PIPES_LIST[pipeindex]).convert_alpha(),
-        )
+    # select random pipe sprites
+    pipeindex = random.randint(0, len(PIPES_LIST) - 1)
+    IMAGES['pipe'] = (
+        pygame.transform.flip(
+            pygame.image.load(PIPES_LIST[pipeindex]).convert_alpha(), False, True),
+        pygame.image.load(PIPES_LIST[pipeindex]).convert_alpha(),
+    )
 
-        # hitmask for pipes
-        HITMASKS['pipe'] = (
-            getHitmask(IMAGES['pipe'][0]),
-            getHitmask(IMAGES['pipe'][1]),
-        )
+    # hitmask for pipes
+    HITMASKS['pipe'] = (
+        getHitmask(IMAGES['pipe'][0]),
+        getHitmask(IMAGES['pipe'][1]),
+    )
 
-        # hitmask for player
-        HITMASKS['player'] = (
-            getHitmask(IMAGES['player'][0]),
-            getHitmask(IMAGES['player'][1]),
-            getHitmask(IMAGES['player'][2]),
-        )
-
-        movementInfo = showWelcomeAnimation()
-        crashInfo = mainGame(movementInfo)
-        showGameOverScreen(crashInfo)
+    # hitmask for player
+    HITMASKS['player'] = (
+        getHitmask(IMAGES['player'][0]),
+        getHitmask(IMAGES['player'][1]),
+        getHitmask(IMAGES['player'][2]),
+    )
 
 
-def showWelcomeAnimation():
-    """Shows welcome screen animation of flappy bird"""
-    # index of player to blit on screen
-    playerIndex = 0
+class Player():
+    def __init__(self, movementInfo):
+        self.playerx = int(SCREENWIDTH * 0.2)
+        self.playery = movementInfo['playery']
+        # player velocity, max velocity, downward acceleration, acceleration on flap
+        self.playerVelY    =  -9   # player's velocity along Y, default same as playerFlapped
+        self.playerMaxVelY =  10   # max vel along Y, max descend speed
+        self.playerMinVelY =  -8   # min vel along Y, max ascend speed
+        self.playerAccY    =   1   # players downward acceleration
+        self.playerRot     =  45   # player's rotation
+        self.playerVelRot  =   3   # angular speed
+        self.playerRotThr  =  20   # rotation threshold
+        self.playerFlapAcc =  -9   # players speed on flapping
+        self.playerFlapped = False # True when player flaps
+
+
+def mainGame(genomes, config):
     playerIndexGen = cycle([0, 1, 2, 1])
-    # iterator used to change playerIndex after every 5th iteration
-    loopIter = 0
 
-    playerx = int(SCREENWIDTH * 0.2)
     playery = int((SCREENHEIGHT - IMAGES['player'][0].get_height()) / 2)
 
-    messagex = int((SCREENWIDTH - IMAGES['message'].get_width()) / 2)
-    messagey = int(SCREENHEIGHT * 0.12)
-
     basex = 0
-    # amount by which base can maximum shift to left
-    baseShift = IMAGES['base'].get_width() - IMAGES['background'].get_width()
 
     # player shm for up-down motion on welcome screen
     playerShmVals = {'val': 0, 'dir': 1}
 
-    while True:
-        for event in pygame.event.get():
-            if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
-                pygame.quit()
-                sys.exit()
-            if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
-                # make first flap sound and return values for mainGame
-                SOUNDS['wing'].play()
-                return {
-                    'playery': playery + playerShmVals['val'],
-                    'basex': basex,
-                    'playerIndexGen': playerIndexGen,
-                }
+    movementInfo = {
+        'playery': playery + playerShmVals['val'],
+        'basex': basex,
+        'playerIndexGen': playerIndexGen,
+    }
 
-        # adjust playery, playerIndex, basex
-        if (loopIter + 1) % 5 == 0:
-            playerIndex = next(playerIndexGen)
-        loopIter = (loopIter + 1) % 30
-        basex = -((-basex + 4) % baseShift)
-        playerShm(playerShmVals)
+    # start by creating lists holding the genome itself, the
+    # neural network associated with the genome and the
+    # player object that uses that network to play
+    nets = []
+    players = []
+    ge = []
+    for genome_id, genome in genomes:
+        genome.fitness = 0  # start with fitness level of 0
+        net = neat.nn.FeedForwardNetwork.create(genome, config)
+        nets.append(net)
+        players.append(Player(movementInfo))
+        ge.append(genome)
 
-        # draw sprites
-        SCREEN.blit(IMAGES['background'], (0,0))
-        SCREEN.blit(IMAGES['player'][playerIndex],
-                    (playerx, playery + playerShmVals['val']))
-        SCREEN.blit(IMAGES['message'], (messagex, messagey))
-        SCREEN.blit(IMAGES['base'], (basex, BASEY))
-
-        pygame.display.update()
-        FPSCLOCK.tick(FPS)
-
-
-def mainGame(movementInfo):
     score = playerIndex = loopIter = 0
     playerIndexGen = movementInfo['playerIndexGen']
-    playerx, playery = int(SCREENWIDTH * 0.2), movementInfo['playery']
 
     basex = movementInfo['basex']
     baseShift = IMAGES['base'].get_width() - IMAGES['background'].get_width()
 
     # get 2 new pipes to add to upperPipes lowerPipes list
-    newPipe1 = getRandomPipe()
-    newPipe2 = getRandomPipe()
+    newPipe1 = getRandomPipe(0)
+    newPipe2 = getRandomPipe(0)
 
     # list of upper pipes
     upperPipes = [
         {'x': SCREENWIDTH + 200, 'y': newPipe1[0]['y']},
-        {'x': SCREENWIDTH + 200 + (SCREENWIDTH / 2), 'y': newPipe2[0]['y']},
+        {'x': SCREENWIDTH + 200 + PIPEGAP, 'y': newPipe2[0]['y']},
     ]
 
     # list of lowerpipe
     lowerPipes = [
         {'x': SCREENWIDTH + 200, 'y': newPipe1[1]['y']},
-        {'x': SCREENWIDTH + 200 + (SCREENWIDTH / 2), 'y': newPipe2[1]['y']},
+        {'x': SCREENWIDTH + 200 + PIPEGAP, 'y': newPipe2[1]['y']},
     ]
 
-    dt = FPSCLOCK.tick(FPS)/1000
-    pipeVelX = -128 * dt
+    pipeVelX = -4.224
 
-    # player velocity, max velocity, downward acceleration, acceleration on flap
-    playerVelY    =  -9   # player's velocity along Y, default same as playerFlapped
-    playerMaxVelY =  10   # max vel along Y, max descend speed
-    playerMinVelY =  -8   # min vel along Y, max ascend speed
-    playerAccY    =   1   # players downward acceleration
-    playerRot     =  45   # player's rotation
-    playerVelRot  =   3   # angular speed
-    playerRotThr  =  20   # rotation threshold
-    playerFlapAcc =  -9   # players speed on flapping
-    playerFlapped = False # True when player flaps
-
-
-    while True:
+    while True and len(players) > 0:
         for event in pygame.event.get():
             if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
                 pygame.quit()
                 sys.exit()
-            if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
-                if playery > -2 * IMAGES['player'][0].get_height():
-                    playerVelY = playerFlapAcc
-                    playerFlapped = True
-                    SOUNDS['wing'].play()
 
-        # check for crash here
-        crashTest = checkCrash({'x': playerx, 'y': playery, 'index': playerIndex},
-                               upperPipes, lowerPipes)
-        if crashTest[0]:
-            return {
-                'y': playery,
-                'groundCrash': crashTest[1],
-                'basex': basex,
-                'upperPipes': upperPipes,
-                'lowerPipes': lowerPipes,
-                'score': score,
-                'playerVelY': playerVelY,
-                'playerRot': playerRot
-            }
+        for index, player in enumerate(players):  # give each player a fitness of 0.1 for each frame it stays alive
+            ge[index].fitness += 0.1
 
-        # check for score
-        playerMidPos = playerx + IMAGES['player'][0].get_width() / 2
-        for pipe in upperPipes:
-            pipeMidPos = pipe['x'] + IMAGES['pipe'][0].get_width() / 2
-            if pipeMidPos <= playerMidPos < pipeMidPos + 4:
-                score += 1
-                SOUNDS['point'].play()
+            # send player location, top pipe location and bottom pipe location and determine from network whether to jump or not
+            pipey1, pipey2 = 0, 0
+            pipeHeight = IMAGES['pipe'][0].get_height()
+
+            for pipe in upperPipes:
+                pipePos = pipe['x'] + IMAGES['pipe'][0].get_width()
+                if player.playerx < pipePos:
+                    pipey1 = pipe['y'] + pipeHeight
+                    break
+
+            for pipe in lowerPipes:
+                pipePos = pipe['x'] + IMAGES['pipe'][0].get_width()
+                if player.playerx < pipePos:
+                    pipey2 = pipe['y']
+                    break
+
+            output = nets[players.index(player)].activate((player.playery, abs(player.playery - pipey1), abs(player.playery - pipey2)))
+
+            if output[0] > 0.5:  # we use a tanh activation function so result will be between -1 and 1. if over 0.5 jump
+                if players[index].playery > -2 * IMAGES['player'][0].get_height():
+                    players[index].playerVelY = players[index].playerFlapAcc
+                    players[index].playerFlapped = True
+
+        for player in players:
+            # check for crash here
+            crashTest = checkCrash({'x': player.playerx, 'y': player.playery, 'index': playerIndex},
+                                upperPipes, lowerPipes)
+            if crashTest[0]:
+                ge[players.index(player)].fitness -= 1
+                nets.pop(players.index(player))
+                ge.pop(players.index(player))
+                players.pop(players.index(player))
+
+        if len(players) > 0:
+            # check for score
+            playerMidPos = players[0].playerx + IMAGES['player'][0].get_width() / 2
+            for pipe in upperPipes:
+                pipeMidPos = pipe['x'] + IMAGES['pipe'][0].get_width() / 2
+                if pipeMidPos <= playerMidPos < pipeMidPos + 4.25:
+                    score += 1
+                    # can add this line to give more reward for passing through a pipe (not required)
+                    for genome in ge:
+                        genome.fitness += 5
 
         # playerIndex basex change
         if (loopIter + 1) % 3 == 0:
@@ -264,21 +255,22 @@ def mainGame(movementInfo):
         loopIter = (loopIter + 1) % 30
         basex = -((-basex + 100) % baseShift)
 
-        # rotate the player
-        if playerRot > -90:
-            playerRot -= playerVelRot
+        for player in players:
+            # rotate the player
+            if player.playerRot > -90:
+                player.playerRot -= player.playerVelRot
 
-        # player's movement
-        if playerVelY < playerMaxVelY and not playerFlapped:
-            playerVelY += playerAccY
-        if playerFlapped:
-            playerFlapped = False
+            # player's movement
+            if player.playerVelY < player.playerMaxVelY and not player.playerFlapped:
+                player.playerVelY += player.playerAccY
+            if player.playerFlapped:
+                player.playerFlapped = False
 
-            # more rotation to cover the threshold (calculated in visible rotation)
-            playerRot = 45
+                # more rotation to cover the threshold (calculated in visible rotation)
+                player.playerRot = 45
 
-        playerHeight = IMAGES['player'][playerIndex].get_height()
-        playery += min(playerVelY, BASEY - playery - playerHeight)
+            playerHeight = IMAGES['player'][playerIndex].get_height()
+            player.playery += min(player.playerVelY, BASEY - player.playery - playerHeight)
 
         # move pipes to left
         for uPipe, lPipe in zip(upperPipes, lowerPipes):
@@ -287,7 +279,7 @@ def mainGame(movementInfo):
 
         # add new pipe when first pipe is about to touch left of screen
         if 3 > len(upperPipes) > 0 and 0 < upperPipes[0]['x'] < 5:
-            newPipe = getRandomPipe()
+            newPipe = getRandomPipe(upperPipes[-1]['x'])
             upperPipes.append(newPipe[0])
             lowerPipes.append(newPipe[1])
 
@@ -307,99 +299,26 @@ def mainGame(movementInfo):
         # print score so player overlaps the score
         showScore(score)
 
-        # Player rotation has a threshold
-        visibleRot = playerRotThr
-        if playerRot <= playerRotThr:
-            visibleRot = playerRot
+        for player in players:
+            # Player rotation has a threshold
+            visibleRot = player.playerRotThr
+            if player.playerRot <= player.playerRotThr:
+                visibleRot = player.playerRot
         
-        playerSurface = pygame.transform.rotate(IMAGES['player'][playerIndex], visibleRot)
-        SCREEN.blit(playerSurface, (playerx, playery))
+            playerSurface = pygame.transform.rotate(IMAGES['player'][playerIndex], visibleRot)
+            SCREEN.blit(playerSurface, (player.playerx, player.playery))
 
         pygame.display.update()
         FPSCLOCK.tick(FPS)
 
 
-def showGameOverScreen(crashInfo):
-    """crashes the player down and shows gameover image"""
-    score = crashInfo['score']
-    playerx = SCREENWIDTH * 0.2
-    playery = crashInfo['y']
-    playerHeight = IMAGES['player'][0].get_height()
-    playerVelY = crashInfo['playerVelY']
-    playerAccY = 2
-    playerRot = crashInfo['playerRot']
-    playerVelRot = 7
-
-    basex = crashInfo['basex']
-
-    upperPipes, lowerPipes = crashInfo['upperPipes'], crashInfo['lowerPipes']
-
-    # play hit and die sounds
-    SOUNDS['hit'].play()
-    if not crashInfo['groundCrash']:
-        SOUNDS['die'].play()
-
-    while True:
-        for event in pygame.event.get():
-            if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
-                pygame.quit()
-                sys.exit()
-            if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
-                if playery + playerHeight >= BASEY - 1:
-                    return
-
-        # player y shift
-        if playery + playerHeight < BASEY - 1:
-            playery += min(playerVelY, BASEY - playery - playerHeight)
-
-        # player velocity change
-        if playerVelY < 15:
-            playerVelY += playerAccY
-
-        # rotate only when it's a pipe crash
-        if not crashInfo['groundCrash']:
-            if playerRot > -90:
-                playerRot -= playerVelRot
-
-        # draw sprites
-        SCREEN.blit(IMAGES['background'], (0,0))
-
-        for uPipe, lPipe in zip(upperPipes, lowerPipes):
-            SCREEN.blit(IMAGES['pipe'][0], (uPipe['x'], uPipe['y']))
-            SCREEN.blit(IMAGES['pipe'][1], (lPipe['x'], lPipe['y']))
-
-        SCREEN.blit(IMAGES['base'], (basex, BASEY))
-        showScore(score)
-
-        
-
-
-        playerSurface = pygame.transform.rotate(IMAGES['player'][1], playerRot)
-        SCREEN.blit(playerSurface, (playerx,playery))
-        SCREEN.blit(IMAGES['gameover'], (50, 180))
-
-        FPSCLOCK.tick(FPS)
-        pygame.display.update()
-
-
-def playerShm(playerShm):
-    """oscillates the value of playerShm['val'] between 8 and -8"""
-    if abs(playerShm['val']) == 8:
-        playerShm['dir'] *= -1
-
-    if playerShm['dir'] == 1:
-         playerShm['val'] += 1
-    else:
-        playerShm['val'] -= 1
-
-
-def getRandomPipe():
+def getRandomPipe(pos):
     """returns a randomly generated pipe"""
     # y of gap between upper and lower pipe
     gapY = random.randrange(0, int(BASEY * 0.6 - PIPEGAPSIZE))
     gapY += int(BASEY * 0.2)
     pipeHeight = IMAGES['pipe'][0].get_height()
-    pipeX = SCREENWIDTH + 10
+    pipeX = pos + PIPEGAP
 
     return [
         {'x': pipeX, 'y': gapY - pipeHeight},  # upper pipe
@@ -482,5 +401,37 @@ def getHitmask(image):
             mask[x].append(bool(image.get_at((x,y))[3]))
     return mask
 
+def run(config_file):
+    """
+    runs the NEAT algorithm to train a neural network to play flappy bird.
+    :param config_file: location of config file
+    :return: None
+    """
+    config = neat.config.Config(neat.DefaultGenome, neat.DefaultReproduction,
+                         neat.DefaultSpeciesSet, neat.DefaultStagnation,
+                         config_file)
+
+    # Create the population, which is the top-level object for a NEAT run.
+    p = neat.Population(config)
+
+    # Add a stdout reporter to show progress in the terminal.
+    p.add_reporter(neat.StdOutReporter(True))
+    stats = neat.StatisticsReporter()
+    p.add_reporter(stats)
+    #p.add_reporter(neat.Checkpointer(5))
+
+    # Run for up to 100 generations.
+    winner = p.run(mainGame, 100)
+
+    # show final stats
+    print('\nBest genome:\n{!s}'.format(winner))
+
+
 if __name__ == '__main__':
+    # Determine path to configuration file. This path manipulation is
+    # here so that the script will run successfully regardless of the
+    # current working directory.
+    local_dir = os.path.dirname(__file__)
+    config_path = os.path.join(local_dir, 'config-feedforward.txt')
     main()
+    run(config_path)
